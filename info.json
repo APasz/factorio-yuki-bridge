@@ -1,0 +1,9 @@
+{
+    "name": "yuki-bridge",
+    "version": "1.0.0",
+    "title": "Yukibot Bridge",
+    "author": "APasz",
+    "description": "Simple RCON/chat/log bridge for Yukibot",
+    "factorio_version": "2.1",
+    "dependencies": ["base >= 2.1.0"]
+}
