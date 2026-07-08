@@ -32,6 +32,16 @@ local function player_name(player_index)
     return player and player.name or nil
 end
 
+local function get_player_chat_color(name)
+    local player = game.get_player(name)
+
+    if player and player.valid then
+        return player.chat_color
+    end
+
+    return nil
+end
+
 local function entity_summary(entity)
     if not entity or not entity.valid then
         return nil
@@ -78,9 +88,20 @@ local function bridge_say(raw)
         return false, "Message is empty"
     end
 
-    game.print(speaker .. ": " .. message)
+    local color = get_player_chat_color(speaker)
 
-    emit("bridge_message", { source = "rcon", speaker = speaker, message = message })
+    if color then
+        game.print(speaker .. ": " .. message, { color = color })
+    else
+        game.print(speaker .. ": " .. message)
+    end
+
+    emit("bridge_message", {
+        source = "rcon",
+        speaker = speaker,
+        message = message,
+        matched_player = color ~= nil,
+    })
 
     return true, "ok"
 end
