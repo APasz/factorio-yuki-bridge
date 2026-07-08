@@ -78,7 +78,7 @@ local function bridge_say(raw)
         return false, "Message is empty"
     end
 
-    game.print(speaker, ": ", message)
+    game.print(speaker .. ": " .. message)
 
     emit("bridge_message", { source = "rcon", speaker = speaker, message = message })
 
