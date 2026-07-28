@@ -1,14 +1,59 @@
 local MOD = "yuki-bridge"
 local OUT_FILE = "yuki/events.ndjson"
+local PROTOCOL_VERSION = 2
+local REQUEST_ID_MAX_LEN = 64
 
-local function reply(command, message)
-    rcon.print(message)
+local function mod_version()
+    return script.active_mods[MOD] or "unknown"
+end
 
+local function ensure_stream_state()
+    if type(storage.yuki_bridge_sequence) ~= "number" then
+        storage.yuki_bridge_sequence = 0
+    end
+
+    if type(storage.yuki_bridge_stream_id) ~= "string" or storage.yuki_bridge_stream_id == "" then
+        storage.yuki_bridge_stream_id = string.format("%s-%d-%d", MOD, game.tick, game.ticks_played)
+    end
+end
+
+local function protocol_metadata()
+    return {
+        schema_version = PROTOCOL_VERSION,
+        mod = MOD,
+        mod_version = mod_version(),
+        tick = game.tick,
+    }
+end
+
+local function reply_player(command, message)
     if command.player_index then
         local player = game.get_player(command.player_index)
         if player then
             player.print("[Yuki] " .. message)
         end
+    end
+end
+
+local function command_response(command, action, request_id, ok, result, error_message)
+    local response = protocol_metadata()
+    response.kind = "command_result"
+    response.command = action
+    response.request_id = request_id
+    response.ok = ok
+
+    if result ~= nil then
+        response.result = result
+    end
+
+    if error_message ~= nil then
+        response.error = error_message
+    end
+
+    rcon.print(helpers.table_to_json(response))
+
+    if command.player_index then
+        reply_player(command, ok and "Done!" or error_message)
     end
 end
 
@@ -42,6 +87,17 @@ local function get_player_chat_color(name)
     return nil
 end
 
+local function position_summary(position)
+    if not position then
+        return nil
+    end
+
+    return {
+        x = position.x or position[1],
+        y = position.y or position[2],
+    }
+end
+
 local function entity_summary(entity)
     if not entity or not entity.valid then
         return nil
@@ -52,28 +108,60 @@ local function entity_summary(entity)
         type = entity.type,
         force = entity.force and entity.force.name or nil,
         surface = entity.surface and entity.surface.name or nil,
-        position = entity.position and { x = entity.position.x, y = entity.position.y } or nil,
+        position = entity.position and position_summary(entity.position) or nil,
     }
 end
 
 local function emit(kind, data)
+    ensure_stream_state()
+
     data = data or {}
+    storage.yuki_bridge_sequence = storage.yuki_bridge_sequence + 1
+
+    data.schema_version = PROTOCOL_VERSION
     data.kind = kind
     data.tick = game.tick
     data.mod = MOD
+    data.mod_version = mod_version()
+    data.stream_id = storage.yuki_bridge_stream_id
+    data.sequence = storage.yuki_bridge_sequence
+    data.event_id = string.format("%s:%d", data.stream_id, data.sequence)
 
     local line = helpers.table_to_json(data)
 
     log("[Yuki] " .. line)
 
     helpers.write_file(OUT_FILE, line .. "\n", true, 0)
+
+    return data
 end
 
-local function print_rcon(data)
-    rcon.print(helpers.table_to_json(data))
+local function valid_request_id(value)
+    return value:match("^[%w][%w._:-]*$") ~= nil
 end
 
-local function bridge_say(raw)
+local function parse_command(raw)
+    local request_id, command_text = raw:match("^%-%-request%-id%s+(%S+)%s+(.+)$")
+
+    if request_id then
+        if #request_id > REQUEST_ID_MAX_LEN then
+            return nil, nil, nil, "Request ID must be 64 characters or fewer."
+        end
+
+        if not valid_request_id(request_id) then
+            return nil, nil, nil, "Request ID must use only letters, digits, '.', '_', ':', or '-'."
+        end
+    elseif raw:match("^%-%-request%-id") then
+        return nil, nil, nil, "Usage: --request-id <id> must be followed by a Yuki command."
+    else
+        command_text = raw
+    end
+
+    local action, rest = command_text:match("^(%S+)%s*(.*)$")
+    return action, rest, request_id, nil
+end
+
+local function bridge_say(raw, request_id)
     raw = clean(raw, 1200)
 
     local speaker, message = raw:match("^([^|]+)|(.+)$")
@@ -96,14 +184,19 @@ local function bridge_say(raw)
         game.print(speaker .. ": " .. message)
     end
 
-    emit("bridge_message", {
+    local emitted = emit("bridge_message", {
         source = "rcon",
         speaker = speaker,
         message = message,
         matched_player = color ~= nil,
+        request_id = request_id,
     })
 
-    return true, "ok"
+    return true, {
+        event_id = emitted.event_id,
+        speaker = speaker,
+        matched_player = color ~= nil,
+    }
 end
 
 local function surface_summary(surface)
@@ -119,6 +212,79 @@ local function surface_summary(surface)
         planet = planet,
         platform = surface.platform and surface.platform.valid and surface.platform.name or nil,
     }
+end
+
+local function autoplace_controls_summary(controls)
+    local summaries = {}
+
+    for name, control in pairs(controls) do
+        table.insert(summaries, {
+            name = name,
+            frequency = control.frequency,
+            size = control.size,
+            richness = control.richness,
+        })
+    end
+
+    table.sort(summaries, function(left, right)
+        return left.name < right.name
+    end)
+
+    return summaries
+end
+
+local function starting_points_summary(points)
+    local summaries = {}
+
+    for _, point in ipairs(points) do
+        table.insert(summaries, position_summary(point))
+    end
+
+    return summaries
+end
+
+local function mapgen_surface_summary(surface)
+    local settings = surface.map_gen_settings
+
+    return {
+        surface = surface_summary(surface),
+        map_exchange_string = surface.get_map_exchange_string(),
+        settings = {
+            seed = settings.seed,
+            width = settings.width,
+            height = settings.height,
+            starting_area = settings.starting_area,
+            starting_points = starting_points_summary(settings.starting_points),
+            peaceful_mode = settings.peaceful_mode,
+            no_enemies_mode = settings.no_enemies_mode,
+            default_enable_all_autoplace_controls = settings.default_enable_all_autoplace_controls,
+            autoplace_controls = autoplace_controls_summary(settings.autoplace_controls),
+        },
+    }
+end
+
+local function mapgen_for_surface(surface_name)
+    local surface = game.get_surface(surface_name)
+
+    if not surface then
+        return nil, "Unknown surface: " .. surface_name
+    end
+
+    return { surfaces = { mapgen_surface_summary(surface) } }, nil
+end
+
+local function all_mapgen()
+    local surfaces = {}
+
+    for _, surface in pairs(game.surfaces) do
+        table.insert(surfaces, mapgen_surface_summary(surface))
+    end
+
+    table.sort(surfaces, function(left, right)
+        return left.surface.index < right.surface.index
+    end)
+
+    return { surfaces = surfaces }
 end
 
 local function evolution_for_force(force_name)
@@ -156,13 +322,87 @@ local function all_evolution()
     return { kind = "evolution", tick = game.tick, forces = forces }
 end
 
-commands.add_command("yuki", "Yuki bridge command: say/evolution", function(command)
+local function respond_with_event(command, action, request_id, kind, payload)
+    payload.by = player_name(command.player_index) or "rcon"
+    payload.request_id = request_id
+
+    local emitted = emit(kind, payload)
+    command_response(command, action, request_id, true, emitted, nil)
+end
+
+local function respond_with_error(command, action, request_id, error_message)
+    emit("error", {
+        command = action,
+        error = error_message,
+        by = player_name(command.player_index) or "rcon",
+        request_id = request_id,
+    })
+    command_response(command, action, request_id, false, nil, error_message)
+end
+
+local function capabilities()
+    return {
+        schema_version = PROTOCOL_VERSION,
+        event_envelope = {
+            "schema_version",
+            "event_id",
+            "stream_id",
+            "sequence",
+            "tick",
+            "mod",
+            "mod_version",
+            "kind",
+        },
+        commands = {
+            "capabilities",
+            "say",
+            "evolution",
+            "mapgen",
+        },
+        events = {
+            "bridge_message",
+            "chat",
+            "error",
+            "evolution",
+            "mapgen",
+            "player_died",
+            "research_finished",
+        },
+        request_correlation = {
+            argument = "--request-id <id>",
+            id_pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            max_id_length = REQUEST_ID_MAX_LEN,
+            response_field = "request_id",
+            event_field = "request_id",
+        },
+        factorio_version = script.active_mods.base or "unknown",
+    }
+end
+
+script.on_init(ensure_stream_state)
+script.on_configuration_changed(ensure_stream_state)
+
+commands.add_command("yuki", "Yuki bridge command: capabilities/say/evolution/mapgen", function(command)
     local param = clean(command.parameter or "", 1500)
-    local action, rest = param:match("^(%S+)%s*(.*)$")
+    local action, rest, request_id, parse_error = parse_command(param)
+
+    if parse_error then
+        command_response(command, "unknown", nil, false, nil, parse_error)
+        return
+    end
+
+    if action == "capabilities" then
+        command_response(command, action, request_id, true, capabilities(), nil)
+        return
+    end
 
     if action == "say" then
-        local ok, result = bridge_say(rest)
-        reply(command, result)
+        local ok, result = bridge_say(rest, request_id)
+        if ok then
+            command_response(command, action, request_id, true, result, nil)
+        else
+            command_response(command, action, request_id, false, nil, result)
+        end
         return
     end
 
@@ -179,13 +419,7 @@ commands.add_command("yuki", "Yuki bridge command: say/evolution", function(comm
         else
             local result, err = evolution_for_force(force_name)
             if not result then
-                reply(command, err)
-
-                emit("error", {
-                    command = "evolution",
-                    error = err,
-                    by = player_name(command.player_index) or "rcon",
-                })
+                respond_with_error(command, action, request_id, err)
                 return
             end
 
@@ -197,20 +431,43 @@ commands.add_command("yuki", "Yuki bridge command: say/evolution", function(comm
             }
         end
 
-        payload.by = player_name(command.player_index) or "rcon"
-
-        print_rcon(payload)
-
-        emit("evolution", payload)
-
-        if command.player_index then
-            reply(command, "Done!")
-        end
+        respond_with_event(command, action, request_id, "evolution", payload)
 
         return
     end
 
-    rcon.print("Usage: /yuki say Speaker|message | /yuki evolution [enemy|all|force]")
+    if action == "mapgen" then
+        local surface_name = clean(rest, 64)
+        local payload, err
+
+        if surface_name == "" then
+            surface_name = "nauvis"
+        end
+
+        if surface_name == "all" then
+            payload = all_mapgen()
+        else
+            payload, err = mapgen_for_surface(surface_name)
+        end
+
+        if not payload then
+            respond_with_error(command, action, request_id, err)
+            return
+        end
+
+        respond_with_event(command, action, request_id, "mapgen", payload)
+
+        return
+    end
+
+    command_response(
+        command,
+        action or "unknown",
+        request_id,
+        false,
+        nil,
+        "Usage: /yuki [--request-id <id>] capabilities | say Speaker|message | evolution [enemy|all|force] | mapgen [surface|all]"
+    )
 end)
 
 script.on_event(defines.events.on_player_died, function(event)
@@ -220,7 +477,7 @@ script.on_event(defines.events.on_player_died, function(event)
         player = player and player.name or nil,
         player_index = event.player_index,
         surface = player and player.surface and player.surface.name or nil,
-        position = player and player.position and { x = player.position.x, y = player.position.y } or nil,
+        position = player and player.position and position_summary(player.position) or nil,
         cause = entity_summary(event.cause),
     })
 end)
