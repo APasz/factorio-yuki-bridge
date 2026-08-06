@@ -1,7 +1,15 @@
 local MOD = "yuki-bridge"
 local OUT_FILE = "yuki/events.ndjson"
-local PROTOCOL_VERSION = 2
+local PROTOCOL_VERSION = 3
 local REQUEST_ID_MAX_LEN = 64
+local MAPGEN_SNAPSHOT_TRIGGERS = {
+    initialized = "initialized",
+    configuration_changed = "configuration_changed",
+    surface_created = "surface_created",
+    surface_deleted = "surface_deleted",
+    surface_imported = "surface_imported",
+    surface_renamed = "surface_renamed",
+}
 
 local function mod_version()
     return script.active_mods[MOD] or "unknown"
@@ -263,16 +271,6 @@ local function mapgen_surface_summary(surface)
     }
 end
 
-local function mapgen_for_surface(surface_name)
-    local surface = game.get_surface(surface_name)
-
-    if not surface then
-        return nil, "Unknown surface: " .. surface_name
-    end
-
-    return { surfaces = { mapgen_surface_summary(surface) } }, nil
-end
-
 local function all_mapgen()
     local surfaces = {}
 
@@ -285,6 +283,12 @@ local function all_mapgen()
     end)
 
     return { surfaces = surfaces }
+end
+
+local function emit_mapgen_snapshot(trigger)
+    local snapshot = all_mapgen()
+    snapshot.trigger = trigger
+    emit("mapgen_snapshot", snapshot)
 end
 
 local function evolution_for_force(force_name)
@@ -357,16 +361,28 @@ local function capabilities()
             "capabilities",
             "say",
             "evolution",
-            "mapgen",
         },
         events = {
             "bridge_message",
             "chat",
             "error",
             "evolution",
-            "mapgen",
+            "mapgen_snapshot",
             "player_died",
             "research_finished",
+        },
+        automatic_events = {
+            mapgen_snapshot = {
+                delivery = "event_stream",
+                triggers = {
+                    MAPGEN_SNAPSHOT_TRIGGERS.initialized,
+                    MAPGEN_SNAPSHOT_TRIGGERS.configuration_changed,
+                    MAPGEN_SNAPSHOT_TRIGGERS.surface_created,
+                    MAPGEN_SNAPSHOT_TRIGGERS.surface_deleted,
+                    MAPGEN_SNAPSHOT_TRIGGERS.surface_imported,
+                    MAPGEN_SNAPSHOT_TRIGGERS.surface_renamed,
+                },
+            },
         },
         request_correlation = {
             argument = "--request-id <id>",
@@ -379,10 +395,27 @@ local function capabilities()
     }
 end
 
-script.on_init(ensure_stream_state)
-script.on_configuration_changed(ensure_stream_state)
+local function initialize_bridge()
+    ensure_stream_state()
+    emit_mapgen_snapshot(MAPGEN_SNAPSHOT_TRIGGERS.initialized)
+end
 
-commands.add_command("yuki", "Yuki bridge command: capabilities/say/evolution/mapgen", function(command)
+local function register_mapgen_snapshot_event(event_id, trigger)
+    script.on_event(event_id, function()
+        emit_mapgen_snapshot(trigger)
+    end)
+end
+
+script.on_init(initialize_bridge)
+script.on_configuration_changed(function()
+    emit_mapgen_snapshot(MAPGEN_SNAPSHOT_TRIGGERS.configuration_changed)
+end)
+register_mapgen_snapshot_event(defines.events.on_surface_created, MAPGEN_SNAPSHOT_TRIGGERS.surface_created)
+register_mapgen_snapshot_event(defines.events.on_surface_deleted, MAPGEN_SNAPSHOT_TRIGGERS.surface_deleted)
+register_mapgen_snapshot_event(defines.events.on_surface_imported, MAPGEN_SNAPSHOT_TRIGGERS.surface_imported)
+register_mapgen_snapshot_event(defines.events.on_surface_renamed, MAPGEN_SNAPSHOT_TRIGGERS.surface_renamed)
+
+commands.add_command("yuki", "Yuki bridge command: capabilities/say/evolution", function(command)
     local param = clean(command.parameter or "", 1500)
     local action, rest, request_id, parse_error = parse_command(param)
 
@@ -393,6 +426,18 @@ commands.add_command("yuki", "Yuki bridge command: capabilities/say/evolution/ma
 
     if action == "capabilities" then
         command_response(command, action, request_id, true, capabilities(), nil)
+        return
+    end
+
+    if action == "mapgen" then
+        command_response(
+            command,
+            action,
+            request_id,
+            false,
+            nil,
+            "Map generation settings are published automatically as mapgen_snapshot events. Do not use /c or /silent-command."
+        )
         return
     end
 
@@ -436,37 +481,13 @@ commands.add_command("yuki", "Yuki bridge command: capabilities/say/evolution/ma
         return
     end
 
-    if action == "mapgen" then
-        local surface_name = clean(rest, 64)
-        local payload, err
-
-        if surface_name == "" then
-            surface_name = "nauvis"
-        end
-
-        if surface_name == "all" then
-            payload = all_mapgen()
-        else
-            payload, err = mapgen_for_surface(surface_name)
-        end
-
-        if not payload then
-            respond_with_error(command, action, request_id, err)
-            return
-        end
-
-        respond_with_event(command, action, request_id, "mapgen", payload)
-
-        return
-    end
-
     command_response(
         command,
         action or "unknown",
         request_id,
         false,
         nil,
-        "Usage: /yuki [--request-id <id>] capabilities | say Speaker|message | evolution [enemy|all|force] | mapgen [surface|all]"
+        "Usage: /yuki [--request-id <id>] capabilities | say Speaker|message | evolution [enemy|all|force]"
     )
 end)
 
