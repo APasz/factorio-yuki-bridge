@@ -225,6 +225,10 @@ end
 local function autoplace_controls_summary(controls)
     local summaries = {}
 
+    if type(controls) ~= "table" then
+        return summaries
+    end
+
     for name, control in pairs(controls) do
         table.insert(summaries, {
             name = name,
@@ -243,6 +247,10 @@ end
 
 local function starting_points_summary(points)
     local summaries = {}
+
+    if type(points) ~= "table" then
+        return summaries
+    end
 
     for _, point in ipairs(points) do
         table.insert(summaries, position_summary(point))
